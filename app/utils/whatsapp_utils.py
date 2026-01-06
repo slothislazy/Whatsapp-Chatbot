@@ -4,6 +4,7 @@ import os
 import random
 import re
 import time
+from collections import OrderedDict
 from textwrap import dedent
 from threading import Lock, Timer
 from typing import Any, Dict
@@ -150,6 +151,32 @@ _DEFAULT_DEBOUNCE_SECONDS = 60.0
 _MAX_BUFFERED_MESSAGES = 10
 _DEFAULT_CLASSIFIER_MODEL = "deepseek-r1:latest"
 _HISTORY_CACHE: Dict[str, bool] = {}
+_SEEN_MESSAGE_IDS: "OrderedDict[str, float]" = OrderedDict()
+_SEEN_MESSAGE_IDS_LOCK = Lock()
+_MAX_SEEN_MESSAGE_IDS = 2000
+_SEEN_MESSAGE_TTL_SECONDS = 300.0
+
+
+def _is_duplicate_message_id(message_id: str) -> bool:
+    if not message_id:
+        return False
+    now = time.time()
+    cutoff = now - _SEEN_MESSAGE_TTL_SECONDS
+    with _SEEN_MESSAGE_IDS_LOCK:
+        while _SEEN_MESSAGE_IDS:
+            first_id, ts = next(iter(_SEEN_MESSAGE_IDS.items()))
+            if ts >= cutoff:
+                break
+            _SEEN_MESSAGE_IDS.popitem(last=False)
+        if message_id in _SEEN_MESSAGE_IDS:
+            _SEEN_MESSAGE_IDS.move_to_end(message_id)
+            _SEEN_MESSAGE_IDS[message_id] = now
+            return True
+        _SEEN_MESSAGE_IDS[message_id] = now
+        if len(_SEEN_MESSAGE_IDS) > _MAX_SEEN_MESSAGE_IDS:
+            _SEEN_MESSAGE_IDS.popitem(last=False)
+    return False
+
 _CLARIFYING_PROMPT = (
     "Halo 👋\nAnda telah terhubung dengan chatbot layanan pelanggan Optimaxx.\nAda yang bisa kami bantu terkait layanan atau pertanyaan Anda?"
 )
@@ -1105,6 +1132,14 @@ def process_whatsapp_message(body):
         )
         return
 
+    if _is_duplicate_message_id(message_id):
+        logging.info(
+            "Skipping duplicate WhatsApp message %s for %s",
+            message_id or "<no-id>",
+            wa_id or chat_id,
+        )
+        return
+
     if from_me and source == "api":
         logging.info("Skipping API-originated self message for %s", wa_id or chat_id_raw)
         return
@@ -1142,6 +1177,9 @@ def process_whatsapp_message(body):
         return
 
     message_body = str(contact_decision.get("message_body") or "").strip()
+    logging.info(
+        "Processing WhatsApp message %s", message_body,
+    )
 
     if has_media:
         logging.info(
