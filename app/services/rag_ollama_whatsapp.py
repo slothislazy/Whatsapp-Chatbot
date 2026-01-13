@@ -58,7 +58,7 @@ DEFAULT_GEN_TEMPERATURE = float("0.15")
 DEFAULT_GEN_REPEAT_PENALTY = float("1.20")
 
 DEFAULT_NUM_CTX = int("16384")
-DEFAULT_MIN_MSG_LENGTH = int("40")
+DEFAULT_MIN_MSG_LENGTH = int("20")
 DEFAULT_MAX_MSG_LENGTH = int("2048")
 DEFAULT_MAX_HISTORY_TURNS = int("12")
 DEFAULT_MODEL_HISTORY_WINDOW = int("5")
@@ -981,7 +981,7 @@ def _guard_message_length(cleaned_body: str, wa_id: str) -> str | None:
     if len(cleaned_body) < DEFAULT_MIN_MSG_LENGTH:
         message = dedent(
             """
-            Mohon maaf, pesan Anda perlu lebih dari 40 karakter ya. 
+            Mohon maaf, pesan Anda perlu lebih dari 20 karakter ya. 
             Silakan tambahkan sedikit penjelasan atau kata kunci agar saya bisa membantu dengan lebih tepat. 🙂
             """
         ).strip()
