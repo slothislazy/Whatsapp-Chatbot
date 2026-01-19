@@ -1207,6 +1207,19 @@ def generate_response(message_body: str, wa_id: str, message_id: str | None = No
                     "Skipping reply for %s because no relevant context was found.", wa_id
                 )
                 return ""
+            
+            # Re-check contact allow_bot in case it changed during generation
+            try:
+                updated_contact = get_contact(wa_id)
+            except Exception:
+                updated_contact = None
+            if updated_contact and not updated_contact.get("allow_bot", True):
+                logging.info(
+                    "Skipping reply for %s because allow_bot was disabled during generation.",
+                    wa_id,
+                )
+                return ""
+            
             # Persist updated history
             state["messages"] = history
             state["handoff_reason"] = state.get("handoff_reason", "")
