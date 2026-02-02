@@ -277,19 +277,8 @@ def _is_vague_routing_reason(reason: str) -> bool:
     text = (reason or "").strip().lower()
     if not text:
         return False
-    vague_tokens = (
-        "vague",
-        "ambigu",
-        "ambiguous",
-        "tidak jelas",
-        "kurang jelas",
-        "bukan pembuka",
-        "opening signal",
-        "ragu",
-        "unclear",
-        "tidak masuk akal"
-    )
-    return any(token in text for token in vague_tokens)
+    target = "tidak ada opening signal (bukan pembuka / tidak jelas)"
+    return text == target
 
 
 def _extract_unix_timestamp(payload: Dict[str, Any]) -> float | None:
@@ -494,45 +483,67 @@ def _fetch_history_sample(chat_id: str, message_ts: float | None, from_me: bool)
     return None
 
 
-def _has_existing_history(chat_id: str, message_ts: float | None = None) -> bool:
+def _has_existing_history(
+    chat_id: str,
+    message_ts: float | None = None,
+    *,
+    candidate_chat_ids: list[str] | None = None,
+) -> bool:
     """
     Check WAHA for prior messages in both directions (from user and from us).
     Returns True only if there is at least one inbound and one outbound message
     older than the current message_ts (when provided). Caches results when no
     timestamp filter is applied.
     """
-    normalized = normalize_chat_id(chat_id)
-    if not normalized:
+    base_candidates = _unique_contact_candidates(*(candidate_chat_ids or []), chat_id)
+    normalized_candidates = []
+    for candidate in base_candidates:
+        normalized = normalize_chat_id(candidate)
+        if normalized:
+            normalized_candidates.append(normalized)
+
+    if not normalized_candidates:
         return False
 
-    cached = _HISTORY_CACHE.get(normalized)
-    if cached is not None and message_ts is None:
-        return cached
+    for normalized in normalized_candidates:
+        cached = _HISTORY_CACHE.get(normalized)
+        if cached is not None and message_ts is None:
+            if cached:
+                logging.info("History found for %s (cache).", normalized)
+            else:
+                logging.info("History not found for %s (cache).", normalized)
+            return cached
 
-    inbound_msg = None
-    outbound_msg = None
-    try:
-        inbound_msg = _fetch_history_sample(normalized, message_ts, from_me=False)
-    except Exception as exc:
-        logging.debug("Inbound history check failed for %s: %s", normalized, exc)
-    try:
-        outbound_msg = _fetch_history_sample(normalized, message_ts, from_me=True)
-    except Exception as exc:
-        logging.debug("Outbound history check failed for %s: %s", normalized, exc)
+        inbound_msg = None
+        outbound_msg = None
+        try:
+            inbound_msg = _fetch_history_sample(normalized, message_ts, from_me=False)
+        except Exception as exc:
+            logging.debug("Inbound history check failed for %s: %s", normalized, exc)
+        try:
+            outbound_msg = _fetch_history_sample(normalized, message_ts, from_me=True)
+        except Exception as exc:
+            logging.debug("Outbound history check failed for %s: %s", normalized, exc)
 
-    history_messages = []
-    if inbound_msg:
-        history_messages.append(inbound_msg)
-    if outbound_msg:
-        history_messages.append(outbound_msg)
+        history_messages = []
+        if inbound_msg:
+            history_messages.append(inbound_msg)
+        if outbound_msg:
+            history_messages.append(outbound_msg)
 
-    has_history = bool(inbound_msg or outbound_msg)
-    if has_history:
-        _log_history_messages(normalized, history_messages)
+        has_history = bool(inbound_msg or outbound_msg)
+        if has_history:
+            _log_history_messages(normalized, history_messages)
+            logging.info("History found for %s.", normalized)
+        else:
+            logging.info("History not found for %s.", normalized)
 
-    if message_ts is None:
-        _HISTORY_CACHE[normalized] = has_history
-    return has_history
+        if message_ts is None:
+            _HISTORY_CACHE[normalized] = has_history
+        if has_history:
+            return True
+
+    return False
 
 
 def _get_test_whitelist() -> set[str]:
@@ -1012,6 +1023,143 @@ def _unique_contact_candidates(*values: str) -> list[str]:
         out.append(raw)
     return out
 
+
+def _expand_contact_candidates(*values: str) -> list[str]:
+    """
+    Expand related lid/c.us identifiers so we can look up either form in contacts.json.
+    """
+    candidates = _unique_contact_candidates(*values)
+    expanded = list(candidates)
+    for value in candidates:
+        expanded.append(value)
+        raw = str(value).strip()
+        lowered = raw.lower()
+        base = raw
+        if lowered.startswith("lid:"):
+            base = raw[4:]
+        elif "@" in raw:
+            base = raw.split("@", 1)[0]
+        digits = re.sub(r"\D", "", base)
+        if digits and digits != base:
+            # keep original base too; add a c.us variant when we can derive digits
+            expanded.append(base)
+            expanded.append(digits)
+            expanded.append(f"{digits}@c.us")
+        elif digits:
+            expanded.append(digits)
+            expanded.append(f"{digits}@c.us")
+    return _unique_contact_candidates(*expanded)
+
+
+def _resolve_lid_to_phone(lid: str) -> str | None:
+    """
+    Resolve a lid to a phone number using WAHA.
+    """
+    lid_value = (lid or "").strip()
+    if not lid_value:
+        return None
+    lid_value = _normalize_lid_value(lid_value)
+    url = f"{_get_waha_base_url()}/api/{_get_waha_session()}/lids/{lid_value}"
+    headers = _build_waha_headers()
+    try:
+        resp = requests.get(url, headers=headers, timeout=5)
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as exc:
+        logging.debug("WAHA lid->phone lookup failed for %s: %s", lid_value, exc)
+        return None
+    if isinstance(payload, dict):
+        phone = payload.get("pn")
+        if phone:
+            return str(phone).strip()
+    return None
+
+
+def _resolve_phone_to_lid(phone: str) -> str | None:
+    """
+    Resolve a phone number to a lid using WAHA.
+    """
+    raw = (phone or "").strip()
+    if not raw:
+        return None
+    digits = re.sub(r"\D", "", raw)
+    if not digits:
+        return None
+    url = f"{_get_waha_base_url()}/api/{_get_waha_session()}/lids/pn/{digits}"
+    headers = _build_waha_headers()
+    try:
+        resp = requests.get(url, headers=headers, timeout=5)
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as exc:
+        logging.debug("WAHA phone->lid lookup failed for %s: %s", digits, exc)
+        return None
+    if isinstance(payload, dict):
+        lid = payload.get("lid") or payload.get("id")
+        if lid:
+            return _normalize_lid_value(str(lid))
+    if isinstance(payload, list) and payload:
+        first = payload[0]
+        if isinstance(first, dict):
+            lid = first.get("lid") or first.get("id")
+            if lid:
+                return _normalize_lid_value(str(lid))
+    return None
+
+
+def _normalize_lid_value(raw: str) -> str:
+    value = (raw or "").strip()
+    lowered = value.lower()
+    if lowered.startswith("lid:"):
+        value = value[4:]
+        lowered = value.lower()
+    if lowered.endswith("@lid"):
+        value = value[:-4]
+    return value.strip()
+
+
+def _expand_contact_candidates_with_waha(*values: str) -> list[str]:
+    """
+    Expand candidates using WAHA lid/phone resolution endpoints.
+    """
+    candidates = _expand_contact_candidates(*values)
+    expanded: list[str] = []
+    for value in candidates:
+        raw = (value or "").strip()
+        if not raw:
+            continue
+        lowered = raw.lower()
+        if lowered.endswith("@lid") or lowered.startswith("lid:"):
+            resolved_phone = _resolve_lid_to_phone(raw)
+            if resolved_phone:
+                logging.info(
+                    "Resolved LID %s to phone %s (c.us).",
+                    raw,
+                    resolved_phone,
+                )
+                expanded.append(resolved_phone)
+                expanded.append(f"{resolved_phone}@c.us")
+            else:
+                logging.info("No phone resolved for LID %s.", raw)
+                continue
+
+        if lowered.endswith("@c.us"):
+            digits = re.sub(r"\D", "", raw)
+            if digits:
+                lid = _resolve_phone_to_lid(digits)
+                if lid:
+                    logging.info(
+                        "Resolved phone %s (c.us) to LID %s.",
+                        digits,
+                        lid,
+                    )
+                    expanded.append(f"lid:{lid}")
+                    expanded.append(f"{lid}@lid")
+                else:
+                    logging.info("No LID resolved for phone %s (c.us).", digits)
+            continue
+    return _unique_contact_candidates(*expanded)
+
 def _apply_contact_policy(
     wa_id: str,
     chat_id: str,
@@ -1063,7 +1211,11 @@ def _apply_contact_policy(
         )
         return None
 
-    if is_new_contact and _has_existing_history(chat_id, message_ts=message_ts):
+    if is_new_contact and _has_existing_history(
+        chat_id,
+        message_ts=message_ts,
+        candidate_chat_ids=candidates,
+    ):
         upsert_contact(
             contact_id or wa_id,
             category="other",
@@ -1164,7 +1316,7 @@ def process_whatsapp_message(body):
         )
         return
 
-    contact_candidates = _unique_contact_candidates(lid_raw, chat_id_raw, wa_id)
+    contact_candidates = _expand_contact_candidates_with_waha(lid_raw, chat_id_raw, wa_id)
     contact_decision = _apply_contact_policy(
         wa_id,
         chat_id,
